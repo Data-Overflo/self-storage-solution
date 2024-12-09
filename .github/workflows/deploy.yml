@@ -1,0 +1,23 @@
+name: Deploy Backend and Frontend
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Deploy Backend
+        run: |
+          cd backend/deployment
+          ./build.sh
+
+      - name: Deploy Frontend
+        run: |
+          cd frontend
+          aws s3 sync . s3://your-s3-bucket-name --acl public-read

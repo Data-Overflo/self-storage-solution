@@ -1,0 +1,215 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Self Storage Solution Infrastructure
+
+Resources:
+  ### Lambda Code Bucket ###
+  LambdaCodeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: self-storage-lambda-code
+      VersioningConfiguration:
+        Status: Enabled
+
+  ### Cognito User Pool ###
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: SelfStorageUserPool
+      AutoVerifiedAttributes:
+        - email
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: SelfStorageAppClient
+      GenerateSecret: true
+
+  ### DynamoDB Tables ###
+  StorageUnitsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: StorageUnitsTable
+      AttributeDefinitions:
+        - AttributeName: UnitID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: UnitID
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  BookingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: BookingsTable
+      AttributeDefinitions:
+        - AttributeName: BookingID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: BookingID
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  ### S3 Bucket for Static Hosting ###
+  StaticSiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: self-storage-static-site
+      WebsiteConfiguration:
+        IndexDocument: index.html
+    DeletionPolicy: Retain
+
+  ### CloudFront Distribution ###
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !GetAtt StaticSiteBucket.DomainName
+            Id: S3Origin
+            S3OriginConfig: {}
+        Enabled: true
+        DefaultRootObject: index.html
+        DefaultCacheBehavior:
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+          TargetOriginId: S3Origin
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  ### API Gateway ###
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: SelfStorageAPI
+
+  ApiGatewayResourceBookings:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: bookings
+      RestApiId: !Ref ApiGateway
+
+  ApiGatewayMethodBookingsPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ApiGatewayResourceBookings
+      HttpMethod: POST
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingLambda.Arn}/invocations
+          - BookingLambda: !Ref BookingLambda
+
+  ### Cognito Authorizer ###
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CognitoAuthorizer
+      RestApiId: !Ref ApiGateway
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - !GetAtt UserPool.Arn
+
+  # Lambda Functions ###
+  BookingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: BookingHandler
+      Handler: index.handler
+      Runtime: python3.9
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: lambdas/booking.zip
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref BookingsTable
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+  NotificationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: NotificationHandler
+      Handler: index.handler
+      Runtime: python3.9
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: lambdas/notifications.zip
+      Environment:
+        Variables:
+          SES_CONFIGURATION_SET: SelfStorageSESConfig
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+  ### Lambda Execution Role ###
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SelfStorageLambdaExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaFullAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: 
+                  - !GetAtt StorageUnitsTable.Arn
+                  - !GetAtt BookingsTable.Arn
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: "*"
+
+  ## SQS Queue ###
+  StorageUnitAccessQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: StorageUnitAccessQueue
+
+  ## EventBridge Rule ###
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: StorageUnitAccessRule
+      EventPattern:
+        source:
+          - "self.storage.access"
+      Targets:
+        - Arn: !GetAtt NotificationLambda.Arn
+          Id: "TargetFunction"
+
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+  
+  ApiGatewayId:
+    Description: API Gateway ID
+    Value: !Ref ApiGateway
+  
+  StaticSiteBucketName:
+    Description: S3 Bucket for Static Site
+    Value: !Ref StaticSiteBucket
